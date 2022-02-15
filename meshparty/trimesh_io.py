@@ -15,7 +15,7 @@ import re
 from collections import defaultdict
 import warnings
 import logging
-from functools import wraps
+from functools import wraps, partial
 import cloudvolume
 from cloudvolume.datasource.precomputed.mesh.multilod import ShardedMultiLevelPrecomputedMeshSource
 from multiwrapper import multiprocessing_utils as mu
@@ -31,6 +31,7 @@ from pymeshfix import _meshfix
 from tqdm import trange
 import DracoPy
 from meshparty import utils, trimesh_repair
+
 
 try:
     from caveclient import infoservice
@@ -225,9 +226,19 @@ def read_mesh(filename):
     else:
         raise Exception("Unknown filetype")
     return vertices, faces, normals, link_edges, node_mask
+def kwarg_wrap(fnkwargs):
+    fn,kwargs = fnkwargs
+    return fn(**kwargs)
 
-
-def _download_meshes_thread_graphene(args):
+def _download_meshes_thread_graphene(seg_ids,
+    cv_path, 
+    target_dir, 
+    fmt, 
+    overwrite,
+    merge_large_components, 
+    map_gs_to_https,  
+    save_draco,
+    **kwargs):
     """ Helper to Download meshes into target directory from graphene sources.
     Parameters
     ----------
@@ -246,24 +257,16 @@ def _download_meshes_thread_graphene(args):
         merge_large_components: bool
             whether to merge all the large components using 'func':trimesh_io.Mesh.merge_large_components
             with default parameters (probably should be False)
-        stitch_mesh_chunks: bool
-            whether to stitch mesh chunks across meshes after downloading fragments (probably should be True)
+        
         map_gs_to_https: bool
             whether to trigger cloudvolume.CloudVolume use_https option. Probably should be true unless you have
             a private bucket and have ~/.cloudvolume/secrets setup properly
-        remove_duplicate_vertices: bool
-            whether to bluntly merge duplicate vertices (probably should be False)
-        chunk_size: tuple
-            size of chunks when deduplicating
         save_draco: bool
             whether to save meshes as draco compressed
-        progress: bool
-            show progress bars
+       
 
      """
-    seg_ids, cv_path, target_dir, fmt, overwrite, \
-        merge_large_components, stitch_mesh_chunks, map_gs_to_https, \
-        remove_duplicate_vertices, progress, chunk_size, save_draco = args
+    
 
     cv = cloudvolume.CloudVolume(cv_path, use_https=map_gs_to_https)
 
@@ -276,8 +279,7 @@ def _download_meshes_thread_graphene(args):
         print('file does not exist {}'.format(target_file))
 
         try:
-            cv_mesh = cv.mesh.get(
-                seg_id, remove_duplicate_vertices=remove_duplicate_vertices)[seg_id]
+            cv_mesh = cv.mesh.get(seg_id, **kwargs)[seg_id]
 
             faces = np.array(cv_mesh.faces)
             if len(faces.shape) == 1:
@@ -303,42 +305,41 @@ def _download_meshes_thread_graphene(args):
             print(e)
 
 
-def _download_meshes_thread_precomputed(args):
-    """ Helper to Download meshes into target directory
+def _download_meshes_thread_precomputed(
+    seg_ids,
+    cv_path, 
+    target_dir, 
+    fmt, 
+    overwrite,
+    merge_large_components, 
+    map_gs_to_https, 
+    progress, 
+    save_draco,
+    **kwargs):
+    """ Helper to Download meshes into target directory. Extra kwargs will be sent to the corresponding CloudVolume `mesh.get` call.
 
     Parameters
     ----------
-    args : tuple
-        seg_ids : iterator of ids
-            the seg ids (with filenames = f"{seg_id}.h5") in the target_dir
-        cv_path: str
-            the cloudvolume path passed to cloudvolume.CloudVolume
-        target_dir: str
-            a path to the diretory to save the meshes
-        fmt: str
-            'hdf5', 'obj', 'stl' or any format supported by 'func':`write_to_file`
-        overwrite: bool
-            whether to overwrite the meshes if they already exist.
-            will do no work if those don't exist
-        merge_large_components: bool
-            whether to merge all the large components using 'func':trimesh_io.Mesh.merge_large_components
-            with default parameters (probably should be False)
-        stitch_mesh_chunks: bool
-            whether to stitch mesh chunks across meshes after downloading fragments (probably should be True)
-        map_gs_to_https: bool
-            whether to trigger cloudvolume.CloudVolume use_https option. Probably should be true unless you have
-            a private bucket and have ~/.cloudvolume/secrets setup properly
-        remove_duplicate_vertices: bool
-            whether to bluntly merge duplicate vertices (probably should be False)
-        chunk_size: tuple
-            chuck size for deduplification
-        progress: bool
-            show progress bars
+    seg_ids : iterator of ids
+        the seg ids (with filenames = f"{seg_id}.h5") in the target_dir
+    cv_path: str
+        the cloudvolume path passed to cloudvolume.CloudVolume
+    target_dir: str
+        a path to the diretory to save the meshes
+    fmt: str
+        'hdf5', 'obj', 'stl' or any format supported by 'func':`write_to_file`
+    overwrite: bool
+        whether to overwrite the meshes if they already exist.
+        will do no work if those don't exist
+    merge_large_components: bool
+        whether to merge all the large components using 'func':trimesh_io.Mesh.merge_large_components
+        with default parameters (probably should be False)
+    map_gs_to_https: bool
+        whether to trigger cloudvolume.CloudVolume use_https option. Probably should be true unless you have
+        a private bucket and have ~/.cloudvolume/secrets setup properly
+    progress: bool
+        show progress bars
      """
-    seg_ids, cv_path, target_dir, fmt, overwrite, \
-        merge_large_components, stitch_mesh_chunks, \
-        map_gs_to_https, remove_duplicate_vertices, \
-        progress, chunk_size, save_draco = args
 
     cv = cloudvolume.CloudVolume(
         cv_path, use_https=map_gs_to_https,
@@ -362,12 +363,12 @@ def _download_meshes_thread_precomputed(args):
     while len(download_segids):
         download_now = download_segids[:100]
         download_segids = download_segids[len(download_now):]
-
+        
         cv_meshes = cv.mesh.get(
             download_now,
-            remove_duplicate_vertices=remove_duplicate_vertices,
-            fuse=False
+            **kwargs
         )
+        
 
         for segid, cv_mesh in cv_meshes.items():
             mesh = Mesh(
@@ -392,16 +393,12 @@ def _download_meshes_thread_precomputed(args):
 
 def download_meshes(seg_ids, target_dir, cv_path, overwrite=True,
                     n_threads=1, verbose=False,
-                    stitch_mesh_chunks=True,
                     merge_large_components=False,
-                    remove_duplicate_vertices=False,
                     map_gs_to_https=True, fmt="hdf5",
                     save_draco=False,
-                    chunk_size=None,
-                    progress=False):
+                    progress=False, **kwargs):
     """ Downloads meshes in target directory (in parallel)
-    will break up the seg_ids into n_threads*3 job blocks or fewer and download them all
-
+    will break up the seg_ids into n_threads*3 job blocks or fewer and download them all. Additional kwargs passed to corresponding CloudVolume get method.
     Parameters
     ----------
     seg_ids : iterator of ids
@@ -415,8 +412,6 @@ def download_meshes(seg_ids, target_dir, cv_path, overwrite=True,
     overwrite: bool
         whether to overwrite the meshes if they already exist.
         will do no work if those don't exist (default True)
-    stitch_mesh_chunks: bool
-        whether to stitch mesh chunks across meshes after downloading fragments (default True)
     merge_large_components: bool
         whether to merge all the large components using 'func':trimesh_io.Mesh.merge_large_components
         with default parameters (default False)
@@ -425,8 +420,6 @@ def download_meshes(seg_ids, target_dir, cv_path, overwrite=True,
     map_gs_to_https: bool
         whether to trigger cloudvolume.CloudVolume use_https option. Probably should be true unless you have
         a private bucket and have ~/.cloudvolume/secrets setup properly (default True)
-    chunk_size: np.array
-        chunk size in nm to use in deduplification (default None)
     fmt: str
         'hdf5', 'obj', 'stl' or any format supported by :func:`meshparty.trimesh_io.Mesh.write_to_file` (default 'hdf5')
     progress: bool
@@ -448,19 +441,24 @@ def download_meshes(seg_ids, target_dir, cv_path, overwrite=True,
 
     seg_id_blocks = np.array_split(seg_ids, n_jobs)
 
-    multi_args = []
+    multi_kwargs = []
     for seg_id_block in seg_id_blocks:
-        multi_args.append([seg_id_block, cv_path, target_dir, fmt,
-                           overwrite, merge_large_components, stitch_mesh_chunks,
-                           map_gs_to_https, remove_duplicate_vertices, progress, chunk_size, save_draco])
+        multi_kwargs.append((_download_meshes_thread, dict(
+            seg_ids=seg_id_block, 
+            cv_path=cv_path, 
+            target_dir=target_dir, 
+            fmt=fmt,       
+            overwrite=overwrite, 
+            merge_large_components=merge_large_components, 
+            map_gs_to_https=map_gs_to_https, 
+            progress=progress, 
+            save_draco=save_draco, **kwargs)))
 
     if n_jobs == 1:
-        mu.multiprocess_func(_download_meshes_thread,
-                             multi_args, debug=True,
+        mu.multiprocess_func(kwarg_wrap,multi_kwargs, debug=True,
                              verbose=verbose, n_threads=n_threads)
     else:
-        mu.multisubprocess_func(_download_meshes_thread,
-                                multi_args, n_threads=n_threads,
+        mu.multisubprocess_func(kwarg_wrap,multi_kwargs, n_threads=n_threads,
                                 package_name="meshparty", n_retries=40)
 
 
